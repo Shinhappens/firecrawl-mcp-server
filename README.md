@@ -8,15 +8,16 @@
 
 # Firecrawl MCP Server
 
-A Model Context Protocol (MCP) server implementation that integrates with [Firecrawl](https://github.com/firecrawl/firecrawl) for web scraping capabilities.
+A Model Context Protocol (MCP) server implementation that integrates with [Firecrawl](https://github.com/firecrawl/firecrawl) for searching, scraping, and interacting with the web.
 
 > Big thanks to [@vrknetha](https://github.com/vrknetha), [@knacklabs](https://www.knacklabs.ai) for the initial implementation!
 
 ## Features
 
-- Web scraping, crawling, and discovery
-- Search and content extraction
-- Deep research and batch scraping
+- Search the web and get full page content
+- Scrape any URL into clean, structured data
+- Interact with pages — click, navigate, and operate
+- Deep research with autonomous agent
 - Cloud browser sessions with agent-browser automation
 - Automatic retries and rate limiting
 - Cloud and self-hosted support

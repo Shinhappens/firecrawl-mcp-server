@@ -1,7 +1,7 @@
 {
   "name": "firecrawl-mcp",
   "version": "3.13.0",
-  "description": "MCP server for Firecrawl web scraping integration. Supports both cloud and self-hosted instances. Features include web scraping, search, batch processing, structured data extraction, and LLM-powered content analysis.",
+  "description": "MCP server for Firecrawl — search, scrape, and interact with the web. Supports both cloud and self-hosted instances. Features include web search, scraping, page interaction, batch processing, and LLM-powered content analysis.",
   "type": "module",
   "mcpName": "io.github.firecrawl/firecrawl-mcp-server",
   "bin": {
@@ -40,9 +40,9 @@
   "keywords": [
     "mcp",
     "firecrawl",
-    "web-scraping",
-    "crawler",
-    "content-extraction"
+    "web-search",
+    "web-data",
+    "web-interaction"
   ],
   "repository": {
     "type": "git",
