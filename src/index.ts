@@ -4,6 +4,8 @@ import { FastMCP, type Logger } from 'firecrawl-fastmcp';
 import { z } from 'zod';
 import FirecrawlApp from '@mendable/firecrawl-js';
 import type { IncomingHttpHeaders } from 'http';
+import { readFile } from 'node:fs/promises';
+import path from 'node:path';
 
 dotenv.config({ debug: false, quiet: true });
 
@@ -49,6 +51,35 @@ function removeEmptyTopLevel<T extends Record<string, any>>(
     out[k] = v;
   }
   return out;
+}
+
+const searchDomainSchema = z
+  .string()
+  .trim()
+  .toLowerCase()
+  .regex(
+    /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$/,
+    'Domain must be a valid hostname without protocol or path'
+  );
+
+function buildSearchQueryWithDomains(
+  query: string,
+  includeDomains?: string[],
+  excludeDomains?: string[]
+): string {
+  if (includeDomains?.length) {
+    return `${query} (${includeDomains
+      .map((domain) => `site:${domain}`)
+      .join(' OR ')})`;
+  }
+
+  if (excludeDomains?.length) {
+    return `${query} ${excludeDomains
+      .map((domain) => `-site:${domain}`)
+      .join(' ')}`;
+  }
+
+  return query;
 }
 
 class ConsoleLogger implements Logger {
@@ -270,6 +301,7 @@ const scrapeParamsSchema = z.object({
         'branding',
         'json',
         'query',
+        'audio',
       ])
     )
     .optional(),
@@ -345,6 +377,11 @@ const scrapeParamsSchema = z.object({
 
 server.addTool({
   name: 'firecrawl_scrape',
+  annotations: {
+    title: 'Scrape a URL',
+    readOnlyHint: SAFE_MODE,
+    openWorldHint: true,
+  },
   description: `
 Scrape content from a single URL with advanced options.
 This is the most powerful, fastest and most reliable scraper tool, if available you should always default to using this tool for any web scraping needs.
@@ -476,6 +513,11 @@ ${
 
 server.addTool({
   name: 'firecrawl_map',
+  annotations: {
+    title: 'Map a website',
+    readOnlyHint: true,
+    openWorldHint: true,
+  },
   description: `
 Map a website to discover all indexed URLs on the site.
 
@@ -536,6 +578,11 @@ Map a website to discover all indexed URLs on the site.
 
 server.addTool({
   name: 'firecrawl_search',
+  annotations: {
+    title: 'Search the web',
+    readOnlyHint: true,
+    openWorldHint: true,
+  },
   description: `
 Search the web and optionally extract content from search results. This is the most powerful web search tool available, and if available you should always default to using this tool for any web search needs.
 
@@ -558,6 +605,7 @@ The query also supports search operators, that you can use if needed to refine t
 **Common mistakes:** Using crawl or map for open-ended questions (use search instead).
 **Prompt Example:** "Find the latest research papers on AI published in 2023."
 **Sources:** web, images, news, default to web unless needed images or news.
+**Domain filters:** Use includeDomains to restrict results to specific domains, or excludeDomains to remove domains. Do not use both in the same request. Domains must be hostnames only, without protocol or path.
 **Scrape Options:** Only use scrapeOptions when you think it is absolutely necessary. When you do so default to a lower limit to avoid timeouts, 5 or lower.
 **Optimal Workflow:** Search first using firecrawl_search without formats, then after fetching the results, use the scrape tool to get the content of the relevantpage(s) that you want to scrape
 
@@ -568,6 +616,7 @@ The query also supports search operators, that you can use if needed to refine t
   "arguments": {
     "query": "top AI companies",
     "limit": 5,
+    "includeDomains": ["example.com"],
     "sources": [
       { "type": "web" }
     ]
@@ -597,18 +646,28 @@ The query also supports search operators, that you can use if needed to refine t
 \`\`\`
 **Returns:** Array of search results (with optional scraped content).
 `,
-  parameters: z.object({
-    query: z.string().min(1),
-    limit: z.number().optional(),
-    tbs: z.string().optional(),
-    filter: z.string().optional(),
-    location: z.string().optional(),
-    sources: z
-      .array(z.object({ type: z.enum(['web', 'images', 'news']) }))
-      .optional(),
-    scrapeOptions: scrapeParamsSchema.omit({ url: true }).partial().optional(),
-    enterprise: z.array(z.enum(['default', 'anon', 'zdr'])).optional(),
-  }),
+  parameters: z
+    .object({
+      query: z.string().min(1),
+      limit: z.number().optional(),
+      tbs: z.string().optional(),
+      filter: z.string().optional(),
+      location: z.string().optional(),
+      includeDomains: z.array(searchDomainSchema).optional(),
+      excludeDomains: z.array(searchDomainSchema).optional(),
+      sources: z
+        .array(z.object({ type: z.enum(['web', 'images', 'news']) }))
+        .optional(),
+      scrapeOptions: scrapeParamsSchema
+        .omit({ url: true })
+        .partial()
+        .optional(),
+      enterprise: z.array(z.enum(['default', 'anon', 'zdr'])).optional(),
+    })
+    .refine(
+      (args) => !(args.includeDomains?.length && args.excludeDomains?.length),
+      'includeDomains and excludeDomains cannot both be specified'
+    ),
   execute: async (
     args: unknown,
     { session, log }: { session?: SessionData; log: Logger }
@@ -617,6 +676,11 @@ The query also supports search operators, that you can use if needed to refine t
     const { query, ...opts } = args as Record<string, unknown>;
 
     const searchOpts = { ...opts } as Record<string, unknown>;
+    const includeDomains = searchOpts.includeDomains as string[] | undefined;
+    const excludeDomains = searchOpts.excludeDomains as string[] | undefined;
+    delete searchOpts.includeDomains;
+    delete searchOpts.excludeDomains;
+
     if (searchOpts.scrapeOptions) {
       searchOpts.scrapeOptions = transformScrapeParams(
         searchOpts.scrapeOptions as Record<string, unknown>
@@ -624,8 +688,13 @@ The query also supports search operators, that you can use if needed to refine t
     }
 
     const cleaned = removeEmptyTopLevel(searchOpts);
-    log.info('Searching', { query: String(query) });
-    const res = await client.search(query as string, {
+    const searchQuery = buildSearchQueryWithDomains(
+      query as string,
+      includeDomains,
+      excludeDomains
+    );
+    log.info('Searching', { query: searchQuery });
+    const res = await client.search(searchQuery, {
       ...(cleaned as any),
       origin: ORIGIN,
     });
@@ -635,6 +704,12 @@ The query also supports search operators, that you can use if needed to refine t
 
 server.addTool({
   name: 'firecrawl_crawl',
+  annotations: {
+    title: 'Start a site crawl',
+    readOnlyHint: false,
+    openWorldHint: true,
+    destructiveHint: false,
+  },
   description: `
  Starts a crawl job on a website and extracts content from all pages.
  
@@ -714,6 +789,11 @@ server.addTool({
 
 server.addTool({
   name: 'firecrawl_check_crawl_status',
+  annotations: {
+    title: 'Get crawl status',
+    readOnlyHint: true,
+    openWorldHint: false,
+  },
   description: `
 Check the status of a crawl job.
 
@@ -741,6 +821,11 @@ Check the status of a crawl job.
 
 server.addTool({
   name: 'firecrawl_extract',
+  annotations: {
+    title: 'Extract structured data',
+    readOnlyHint: true,
+    openWorldHint: true,
+  },
   description: `
 Extract structured information from web pages using LLM capabilities. Supports both cloud AI and self-hosted LLM extraction.
 
@@ -811,6 +896,12 @@ Extract structured information from web pages using LLM capabilities. Supports b
 
 server.addTool({
   name: 'firecrawl_agent',
+  annotations: {
+    title: 'Start a research agent',
+    readOnlyHint: false,
+    openWorldHint: true,
+    destructiveHint: false,
+  },
   description: `
 Autonomous web research agent. This is a separate AI agent layer that independently browses the internet, searches for information, navigates through pages, and extracts structured data based on your query. You describe what you need, and the agent figures out where to find it.
 
@@ -910,6 +1001,11 @@ Then poll with \`firecrawl_agent_status\` every 15-30 seconds for at least 2-3 m
 
 server.addTool({
   name: 'firecrawl_agent_status',
+  annotations: {
+    title: 'Get agent job status',
+    readOnlyHint: true,
+    openWorldHint: false,
+  },
   description: `
 Check the status of an agent job and retrieve results when complete. Use this to poll for results after starting an agent with \`firecrawl_agent\`.
 
@@ -951,6 +1047,12 @@ Check the status of an agent job and retrieve results when complete. Use this to
 // Browser session tools (deprecated — prefer firecrawl_scrape + firecrawl_interact)
 server.addTool({
   name: 'firecrawl_browser_create',
+  annotations: {
+    title: 'Create browser session',
+    readOnlyHint: false,
+    openWorldHint: false,
+    destructiveHint: false,
+  },
   description: `
 **DEPRECATED — prefer firecrawl_scrape + firecrawl_interact instead.** Interact lets you scrape a page and then click, fill forms, and navigate without managing sessions manually.
 
@@ -1000,6 +1102,12 @@ Create a browser session for code execution via CDP (Chrome DevTools Protocol).
 if (!SAFE_MODE) {
   server.addTool({
     name: 'firecrawl_browser_execute',
+    annotations: {
+      title: 'Run code in browser session',
+      readOnlyHint: false,
+      openWorldHint: false,
+      destructiveHint: true,
+    },
     description: `
 **DEPRECATED — prefer firecrawl_scrape + firecrawl_interact instead.** Interact lets you scrape a page and then click, fill forms, and navigate without managing sessions manually.
 
@@ -1077,6 +1185,12 @@ Execute code in a browser session. Supports agent-browser commands (bash), Pytho
 
 server.addTool({
   name: 'firecrawl_browser_delete',
+  annotations: {
+    title: 'Delete browser session',
+    readOnlyHint: false,
+    openWorldHint: false,
+    destructiveHint: true,
+  },
   description: `
 **DEPRECATED — prefer firecrawl_scrape + firecrawl_interact instead.**
 
@@ -1110,6 +1224,11 @@ Destroy a browser session.
 
 server.addTool({
   name: 'firecrawl_browser_list',
+  annotations: {
+    title: 'List browser sessions',
+    readOnlyHint: true,
+    openWorldHint: false,
+  },
   description: `
 **DEPRECATED — prefer firecrawl_scrape + firecrawl_interact instead.**
 
@@ -1144,6 +1263,12 @@ List browser sessions, optionally filtered by status.
 // Interact tools (scrape-bound browser sessions)
 server.addTool({
   name: 'firecrawl_interact',
+  annotations: {
+    title: 'Interact with a scraped page',
+    readOnlyHint: false,
+    openWorldHint: true,
+    destructiveHint: false,
+  },
   description: `
 Interact with a previously scraped page in a live browser session. Scrape a page first with firecrawl_scrape, then use the returned scrapeId to click buttons, fill forms, extract dynamic content, or navigate deeper.
 
@@ -1215,6 +1340,12 @@ Interact with a previously scraped page in a live browser session. Scrape a page
 
 server.addTool({
   name: 'firecrawl_interact_stop',
+  annotations: {
+    title: 'Stop interact session',
+    readOnlyHint: false,
+    openWorldHint: false,
+    destructiveHint: true,
+  },
   description: `
 Stop an interact session for a scraped page. Call this when you are done interacting to free resources.
 
@@ -1243,6 +1374,239 @@ Stop an interact session for a scraped page. Call this when you are done interac
     return asText(res);
   },
 });
+
+// Local-only: parse a local file via the self-hosted Firecrawl /v2/parse endpoint.
+// The parse endpoint is only exposed on self-hosted/local Firecrawl API deployments,
+// so this tool is registered only when the MCP is NOT running in cloud mode.
+if (process.env.CLOUD_SERVICE !== 'true') {
+  const parseParamsSchema = z.object({
+    filePath: z
+      .string()
+      .min(1)
+      .describe(
+        'Absolute or relative path to a local file to parse. Supported: .html, .htm, .pdf, .docx, .doc, .odt, .rtf, .xlsx, .xls'
+      ),
+    contentType: z
+      .string()
+      .optional()
+      .describe(
+        'Optional MIME type override. If omitted, the server infers the file kind from the extension.'
+      ),
+    formats: z
+      .array(
+        z.enum([
+          'markdown',
+          'html',
+          'rawHtml',
+          'links',
+          'summary',
+          'json',
+          'query',
+        ])
+      )
+      .optional(),
+    jsonOptions: z
+      .object({
+        prompt: z.string().optional(),
+        schema: z.record(z.string(), z.any()).optional(),
+      })
+      .optional(),
+    queryOptions: z
+      .object({
+        prompt: z.string().max(10000),
+      })
+      .optional(),
+    parsers: z.array(z.enum(['pdf'])).optional(),
+    pdfOptions: z
+      .object({
+        maxPages: z.number().int().min(1).max(10000).optional(),
+      })
+      .optional(),
+    onlyMainContent: z.boolean().optional(),
+    includeTags: z.array(z.string()).optional(),
+    excludeTags: z.array(z.string()).optional(),
+    removeBase64Images: z.boolean().optional(),
+    skipTlsVerification: z.boolean().optional(),
+    storeInCache: z.boolean().optional(),
+    zeroDataRetention: z.boolean().optional(),
+    maxAge: z.number().optional(),
+    proxy: z.enum(['basic', 'auto']).optional(),
+  });
+
+  const EXTENSION_CONTENT_TYPES: Record<string, string> = {
+    '.html': 'text/html',
+    '.htm': 'text/html',
+    '.pdf': 'application/pdf',
+    '.docx':
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    '.doc': 'application/msword',
+    '.odt': 'application/vnd.oasis.opendocument.text',
+    '.rtf': 'application/rtf',
+    '.xlsx':
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    '.xls': 'application/vnd.ms-excel',
+  };
+
+  function inferContentType(filename: string): string {
+    const ext = path.extname(filename).toLowerCase();
+    return EXTENSION_CONTENT_TYPES[ext] ?? 'application/octet-stream';
+  }
+
+  server.addTool({
+    name: 'firecrawl_parse',
+    annotations: {
+      title: 'Parse a local file',
+      readOnlyHint: true,
+      openWorldHint: false,
+    },
+    description: `
+Parse a file from the local filesystem using a self-hosted Firecrawl API's /v2/parse endpoint.
+This is the fastest and most reliable way to extract content from a document on disk — if the file lives locally and the MCP is pointed at a self-hosted Firecrawl instance, you should always prefer this tool over uploading the file elsewhere and then scraping it.
+
+**Best for:** Extracting content from a local document (PDF, Word, Excel, HTML, etc.) when you don't want to host it on the public web first; pulling structured data out of a file with JSON format; converting binary documents into markdown for downstream reasoning.
+**Not recommended for:** Remote URLs (use firecrawl_scrape); multiple files at once (call parse multiple times); documents that require interactive actions, screenshots, or change tracking — those aren't supported by the parse endpoint.
+**Common mistakes:** Passing a URL instead of a local file path; requesting an unsupported format (screenshot, branding, changeTracking); setting waitFor, location, mobile, or a non-basic/auto proxy — parse uploads reject all of those.
+
+**Supported file types:** .html, .htm, .xhtml, .pdf, .docx, .doc, .odt, .rtf, .xlsx, .xls
+**Unsupported options:** actions, screenshot/branding/changeTracking formats, waitFor > 0, location, mobile, proxy values other than "auto" or "basic".
+
+**CRITICAL - Format Selection (same rules as firecrawl_scrape):**
+When the user asks for SPECIFIC data points from a document, you MUST use JSON format with a schema. Only use markdown when the user needs the ENTIRE document content.
+
+**Use JSON format when the user asks for:**
+- Specific fields, parameters, or values from a form / PDF / spreadsheet
+- Prices, numbers, or other structured data
+- Lists of items or properties
+
+**Use markdown format when:**
+- User wants to read, summarize, or analyze the full document
+- User explicitly asks for the complete content
+
+**Handling PDFs:**
+Add \`"parsers": ["pdf"]\` (optionally with \`pdfOptions.maxPages\`) when parsing a PDF so the PDF engine is invoked explicitly. For very long documents, cap \`maxPages\` to keep the response within token limits.
+
+**Usage Example (markdown from a local PDF):**
+\`\`\`json
+{
+  "name": "firecrawl_parse",
+  "arguments": {
+    "filePath": "/absolute/path/to/document.pdf",
+    "formats": ["markdown"],
+    "parsers": ["pdf"],
+    "onlyMainContent": true
+  }
+}
+\`\`\`
+
+**Usage Example (structured JSON extraction from a local HTML file):**
+\`\`\`json
+{
+  "name": "firecrawl_parse",
+  "arguments": {
+    "filePath": "./invoice.html",
+    "formats": ["json"],
+    "jsonOptions": {
+      "prompt": "Extract the invoice number, total, and line items",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "invoiceNumber": { "type": "string" },
+          "total": { "type": "number" },
+          "lineItems": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "description": { "type": "string" },
+                "amount": { "type": "number" }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+\`\`\`
+**Returns:** A parsed document with markdown, html, links, summary, json, or query results depending on the requested formats.
+`,
+    parameters: parseParamsSchema,
+    execute: async (
+      args: unknown,
+      { session, log }: { session?: SessionData; log: Logger }
+    ): Promise<string> => {
+      const apiUrl = process.env.FIRECRAWL_API_URL;
+      if (!apiUrl) {
+        throw new Error(
+          'firecrawl_parse requires FIRECRAWL_API_URL to be set to a self-hosted Firecrawl API instance.'
+        );
+      }
+
+      const {
+        filePath,
+        contentType: overrideContentType,
+        ...options
+      } = args as {
+        filePath: string;
+        contentType?: string;
+      } & Record<string, unknown>;
+
+      const absPath = path.resolve(filePath);
+      const buffer = await readFile(absPath);
+      const filename = path.basename(absPath);
+      const fileContentType =
+        overrideContentType && overrideContentType.length > 0
+          ? overrideContentType
+          : inferContentType(filename);
+
+      const transformed = transformScrapeParams(
+        options as Record<string, unknown>
+      );
+      const cleaned = removeEmptyTopLevel(transformed) as Record<
+        string,
+        unknown
+      >;
+      const optionsPayload = { origin: ORIGIN, ...cleaned };
+
+      const form = new FormData();
+      const blob = new Blob([new Uint8Array(buffer)], { type: fileContentType });
+      form.append('file', blob, filename);
+      form.append('options', JSON.stringify(optionsPayload));
+
+      const headers: Record<string, string> = {};
+      const apiKey = session?.firecrawlApiKey;
+      if (apiKey) {
+        headers['Authorization'] = `Bearer ${apiKey}`;
+      }
+
+      const endpoint = `${apiUrl.replace(/\/$/, '')}/v2/parse`;
+      log.info('Parsing local file', {
+        endpoint,
+        filename,
+        size: buffer.length,
+      });
+
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers,
+        body: form,
+      });
+
+      const responseText = await response.text();
+      if (!response.ok) {
+        throw new Error(
+          `Parse request failed with status ${response.status}: ${responseText}`
+        );
+      }
+
+      try {
+        return asText(JSON.parse(responseText));
+      } catch {
+        return responseText;
+      }
+    },
+  });
+}
 
 const PORT = Number(process.env.PORT || 3000);
 const HOST =

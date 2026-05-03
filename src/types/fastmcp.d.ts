@@ -32,9 +32,9 @@ declare module 'firecrawl-fastmcp' {
       version?: string;
       logger?: Logger;
       roots?: { enabled?: boolean };
-      authenticate?: (
-        request: { headers: IncomingHttpHeaders }
-      ) => Promise<Session> | Session;
+      authenticate?: (request: {
+        headers: IncomingHttpHeaders;
+      }) => Promise<Session> | Session;
       health?: {
         enabled?: boolean;
         message?: string;
@@ -47,11 +47,39 @@ declare module 'firecrawl-fastmcp' {
       name: string;
       description?: string;
       parameters?: unknown;
+      /** MCP tool annotations (title, readOnlyHint, etc.) */
+      annotations?: {
+        /** A human-readable title for the tool. */
+        title?: string;
+        /**
+         * If true, the tool does not modify its environment.
+         */
+        readOnlyHint?: boolean;
+        /**
+         * If true, the tool may perform destructive updates to its environment. If false, the tool performs only additive updates.
+         *
+         * (This property is meaningful only when `readOnlyHint == false`)
+         */
+        destructiveHint?: boolean;
+        /**
+         * If true, calling the tool repeatedly with the same arguments will have no additional effect on its environment.
+         *
+         * (This property is meaningful only when `readOnlyHint == false`)
+         */
+        idempotentHint?: boolean;
+        /**
+         * If true, this tool may interact with an "open world" of external entities. If false, the tool's domain of interaction is closed. For example, the world of a web search tool is open, whereas that of a memory tool is not.
+         */
+        openWorldHint?: boolean;
+        /**
+         * When true, the tool leverages incremental content streaming.
+         * Return void for tools that handle all their output via streaming.
+         */
+        streamingHint?: boolean;
+      };
       execute: ToolExecute<Session>;
     }): void;
 
     start(args?: TransportArgs): Promise<void>;
   }
 }
-
-
