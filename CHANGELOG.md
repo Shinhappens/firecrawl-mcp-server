@@ -1,5 +1,37 @@
 # Changelog
 
+## [3.20.1] - 2026-05-28
+
+### Fixed
+
+- Fix stdio transport regression introduced in 3.18.0 where every tool call
+  failed with `Unauthorized: API key is required when not using a self-hosted
+  instance` even when `FIRECRAWL_API_KEY` was set. The OAuth refactor in 3.18.0
+  made the `authenticate` callback unconditionally read `request.headers`, but
+  `firecrawl-fastmcp` invokes `authenticate(undefined)` for stdio (there is no
+  HTTP request context). The resulting `TypeError` was swallowed by FastMCP,
+  leaving the session unauthenticated. Added a null guard so env-var
+  credentials (`FIRECRAWL_API_KEY` / `FIRECRAWL_OAUTH_TOKEN`) are honored on
+  stdio again.
+
+## [3.19.1] - 2026-05-27
+
+### Changed
+
+- Refined monitor goal guidance for meaningful-change monitoring.
+- Documented `isMeaningful`, `judgment`, and `meaningfulChanges` monitor results.
+
+## [3.19.0] - 2026-05-25
+
+### Added
+
+- Added a simplified `firecrawl_monitor_create` path using `page` or `pages` plus `goal`.
+- Added monitor check status filtering to `firecrawl_monitor_checks`.
+
+### Changed
+
+- Updated monitor tool guidance to prefer goal-based meaningful-change monitoring and document `judgment` results.
+
 ## [1.7.0] - 2025-03-18
 
 ### Fixed

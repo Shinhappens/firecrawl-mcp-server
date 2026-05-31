@@ -18,7 +18,6 @@ A Model Context Protocol (MCP) server that brings [Firecrawl](https://github.com
 - Scrape any URL into clean, structured data
 - Interact with pages — click, navigate, and operate
 - Deep research with autonomous agent
-- Cloud browser sessions with agent-browser automation
 - Automatic retries and rate limiting
 - Cloud and self-hosted support
 - SSE support
@@ -187,6 +186,15 @@ Optionally, you can add it to a file called `.vscode/mcp.json` in your workspace
   - Example: `https://firecrawl.your-domain.com`
   - If not provided, the cloud API will be used (requires API key)
 
+#### MCP OAuth (Bearer access tokens)
+
+Hosted Firecrawl can issue OAuth **access tokens** (`fco_…`) via the authorization server on [firecrawl.dev](https://firecrawl.dev). This MCP server forwards whichever credential it resolves to the Firecrawl API as `Authorization: Bearer …`.
+
+- **HTTP stream transports** (`CLOUD_SERVICE=true`, `HTTP_STREAMABLE_SERVER=true`, or `SSE_LOCAL=true`): Clients should send `Authorization: Bearer <fco_access_token>` on MCP requests. An OAuth bearer token takes precedence over `x-firecrawl-api-key` / `x-api-key` when both are present.
+- **stdio:** Use `FIRECRAWL_OAUTH_TOKEN` for a static access token, or keep using `FIRECRAWL_API_KEY` for an API key.
+
+Use **access** tokens (`fco_…`) only. Refresh tokens (`fcr_…`) must be exchanged at the token endpoint, not passed to the scrape/search API.
+
 #### Optional Configuration
 
 ##### Retry Configuration
@@ -319,20 +327,18 @@ Use this guide to select the right tool for your task:
 - **If you need complex research across multiple unknown sources:** use **agent**
 - **If you want to analyze a whole site or section:** use **crawl** (with limits!)
 - **If you need interactive browser automation** (click, type, navigate): use **scrape** + **interact**
-- **If you need a raw CDP browser session** (advanced): use **browser** (deprecated)
 
 ### Quick Reference Table
 
-| Tool         | Best for                            | Returns                    |
-| ------------ | ----------------------------------- | -------------------------- |
-| scrape       | Single page content                 | JSON (preferred) or markdown |
-| interact     | Interact with a scraped page        | Execution result           |
-| batch_scrape | Multiple known URLs                 | JSON (preferred) or markdown[] |
-| map          | Discovering URLs on a site          | URL[]                      |
-| crawl        | Multi-page extraction (with limits) | markdown/html[]            |
-| search       | Web search for info                 | results[]                  |
-| agent        | Complex multi-source research       | JSON (structured data)     |
-| browser      | Interactive multi-step automation (deprecated) | Session with live browser  |
+| Tool         | Best for                                       | Returns                        |
+| ------------ | ---------------------------------------------- | ------------------------------ |
+| scrape       | Single page content                            | JSON (preferred) or markdown   |
+| interact     | Interact with a scraped page                   | Execution result               |
+| batch_scrape | Multiple known URLs                            | JSON (preferred) or markdown[] |
+| map          | Discovering URLs on a site                     | URL[]                          |
+| crawl        | Multi-page extraction (with limits)            | markdown/html[]                |
+| search       | Web search for info                            | results[]                      |
+| agent        | Complex multi-source research                  | JSON (structured data)         |
 
 ### Format Selection Guide
 
@@ -377,19 +383,21 @@ Scrape content from a single URL with advanced options.
   "name": "firecrawl_scrape",
   "arguments": {
     "url": "https://example.com/product",
-    "formats": [{
-      "type": "json",
-      "prompt": "Extract the product information",
-      "schema": {
-        "type": "object",
-        "properties": {
-          "name": { "type": "string" },
-          "price": { "type": "number" },
-          "description": { "type": "string" }
-        },
-        "required": ["name", "price"]
+    "formats": [
+      {
+        "type": "json",
+        "prompt": "Extract the product information",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string" },
+            "price": { "type": "number" },
+            "description": { "type": "string" }
+          },
+          "required": ["name", "price"]
+        }
       }
-    }]
+    ]
   }
 }
 ```
@@ -598,7 +606,10 @@ Sends structured feedback on a previous `firecrawl_search` result. The first fee
       }
     ],
     "missingContent": [
-      { "topic": "Pricing for the search endpoint", "description": "No pricing tier table for /search specifically." },
+      {
+        "topic": "Pricing for the search endpoint",
+        "description": "No pricing tier table for /search specifically."
+      },
       { "topic": "Per-team rate limits" }
     ],
     "querySuggestions": "Boost docs.firecrawl.dev for queries that mention 'firecrawl'"
@@ -858,110 +869,73 @@ Check the status of an agent job and retrieve results when complete. Use this to
 - `completed`: Research finished - response includes the extracted data
 - `failed`: An error occurred
 
-### 11. Browser Create (`firecrawl_browser_create`) — Deprecated
+### 11. Monitor Tools (`firecrawl_monitor_*`)
 
-> **Deprecated:** Prefer `firecrawl_scrape` + `firecrawl_interact` instead. Interact lets you scrape a page and then click, fill forms, and navigate without managing sessions manually.
+Create and manage recurring page monitors. Monitors run scheduled scrapes or crawls, diff each result against the last retained snapshot, and can notify by webhook or email.
 
-Create a cloud browser session for interactive automation.
+**Best for:**
 
-**Arguments:**
+- Watching one page or a few pages over time
+- Alerting on meaningful changes using a plain-English goal
+- Tracking check history and page-level diffs
 
-- `ttl`: Total session lifetime in seconds (30-3600, optional)
-- `activityTtl`: Idle timeout in seconds (10-3600, optional)
-- `streamWebView`: Whether to enable live view streaming (optional)
-- `profile`: Save and reuse browser state across sessions (optional)
-  - `name`: Profile name (sessions with the same name share state)
-  - `saveChanges`: Whether to save changes back to the profile (default: true)
+**Recommended create pattern:**
 
-**Usage Example:**
+Use `page` or `pages` plus `goal`. The MCP server builds the monitor request with a 30-minute schedule and the API enables meaningful-change judging automatically.
+
+Meaningful-change judging runs automatically when `goal` is set. Page webhooks expose `isMeaningful` and `judgment` on `monitor.page` events.
+
+Write goals as concise 2-3 sentence monitor instructions. Say what should trigger an alert, preserve any scope the user gave, and include intent-specific exclusions only when obvious from the request. Generic noise such as whitespace, formatting-only changes, request IDs, tracking params, generic metadata, and unrelated page chrome is already handled by the judge, so do not repeat it in every goal. If the user is vague, keep the goal broad; if they ask for broad monitoring or "any change", preserve that. If the user says they do not care about something, include that explicitly.
 
 ```json
 {
-  "name": "firecrawl_browser_create",
+  "name": "firecrawl_monitor_create",
   "arguments": {
-    "ttl": 600,
-    "profile": { "name": "my-profile", "saveChanges": true }
+    "page": "https://example.com/pricing",
+    "goal": "Alert when pricing, packaging, or launch messaging changes."
   }
 }
 ```
 
-**Returns:**
-
-- Session ID, CDP URL, and live view URL
-
-### 12. Browser Execute (`firecrawl_browser_execute`) — Deprecated
-
-> **Deprecated:** Prefer `firecrawl_scrape` + `firecrawl_interact` instead.
-
-Execute code in a browser session. Supports agent-browser commands (bash), Python, or JavaScript.
-
-**Recommended: Use bash with agent-browser commands** (pre-installed in every sandbox):
+**Multiple pages with webhooks:**
 
 ```json
 {
-  "name": "firecrawl_browser_execute",
+  "name": "firecrawl_monitor_create",
   "arguments": {
-    "sessionId": "session-id-here",
-    "code": "agent-browser open https://example.com",
-    "language": "bash"
+    "pages": ["https://example.com/pricing", "https://example.com/changelog"],
+    "goal": "Alert when pricing, packaging, or launch messaging changes.",
+    "webhookUrl": "https://example.com/webhooks/firecrawl"
   }
 }
 ```
 
-**Common agent-browser commands:**
+**Advanced create requests:**
 
-| Command | Description |
-|---------|-------------|
-| `agent-browser open <url>` | Navigate to URL |
-| `agent-browser snapshot` | Accessibility tree with clickable refs |
-| `agent-browser click @e5` | Click element by ref from snapshot |
-| `agent-browser type @e3 "text"` | Type into element |
-| `agent-browser get title` | Get page title |
-| `agent-browser screenshot` | Take screenshot |
-| `agent-browser --help` | Full command reference |
-
-**For Playwright scripting, use Python:**
+Pass `body` when you need crawl targets, JSON change tracking, custom retention, or explicit `judgeEnabled` control.
 
 ```json
 {
-  "name": "firecrawl_browser_execute",
+  "name": "firecrawl_monitor_create",
   "arguments": {
-    "sessionId": "session-id-here",
-    "code": "await page.goto('https://example.com')\ntitle = await page.title()\nprint(title)",
-    "language": "python"
+    "body": {
+      "name": "Docs monitor",
+      "schedule": { "text": "hourly", "timezone": "UTC" },
+      "goal": "Alert when docs pages add, remove, or materially change API behavior.",
+      "targets": [{ "type": "crawl", "url": "https://example.com/docs" }]
+    }
   }
 }
 ```
 
-### 13. Browser List (`firecrawl_browser_list`) — Deprecated
+**Other monitor tools:**
 
-> **Deprecated:** Prefer `firecrawl_scrape` + `firecrawl_interact` instead.
-
-List browser sessions, optionally filtered by status.
-
-```json
-{
-  "name": "firecrawl_browser_list",
-  "arguments": {
-    "status": "active"
-  }
-}
-```
-
-### 14. Browser Delete (`firecrawl_browser_delete`) — Deprecated
-
-> **Deprecated:** Prefer `firecrawl_scrape` + `firecrawl_interact` instead.
-
-Destroy a browser session.
-
-```json
-{
-  "name": "firecrawl_browser_delete",
-  "arguments": {
-    "sessionId": "session-id-here"
-  }
-}
-```
+- `firecrawl_monitor_list`: list monitors.
+- `firecrawl_monitor_get`: get one monitor.
+- `firecrawl_monitor_update`: update fields including `goal`, `judgeEnabled`, `webhook`, and `notification`.
+- `firecrawl_monitor_run`: trigger a check now.
+- `firecrawl_monitor_checks`: list checks, optionally filtered by status.
+- `firecrawl_monitor_check`: get page-level results, including `diff`, `snapshot`, `judgment.meaningful`, and `judgment.meaningfulChanges`.
 
 ## Logging System
 
