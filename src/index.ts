@@ -18,34 +18,12 @@ interface SessionData {
    */
   firecrawlApiKey?: string;
   /**
-   * Whether the (experimental) research tools are exposed for this session.
-   * Enabled locally via `FIRECRAWL_RESEARCH=true`, or per-request via the
-   * `?research=true` query param on the MCP endpoint.
+   * For keyless requests over the hosted (CLOUD_SERVICE) MCP, the end-user's
+   * real client IP, forwarded to the API so it can rate-limit per real IP
+   * instead of the shared server IP.
    */
-  research?: boolean;
+  keylessClientIp?: string;
   [key: string]: unknown;
-}
-
-/**
- * Decide whether the research tools should be visible for a session.
- * Local/stdio/self-hosted: gated by `FIRECRAWL_RESEARCH=true`.
- * Remote (HTTP): additionally enabled by a `?research=true` query param on the
- * incoming MCP request URL.
- */
-function isResearchEnabled(request?: { url?: string }): boolean {
-  if (process.env.FIRECRAWL_RESEARCH === 'true') return true;
-  const url = request?.url;
-  if (url) {
-    try {
-      const research = new URL(url, 'http://localhost').searchParams.get(
-        'research'
-      );
-      if (research === 'true') return true;
-    } catch {
-      // malformed URL — fall through to disabled
-    }
-  }
-  return false;
 }
 
 function normalizeHeader(
@@ -284,7 +262,6 @@ const server = new FastMCP<SessionData>({
     headers: IncomingHttpHeaders;
     url?: string;
   }): Promise<SessionData> => {
-    const research = isResearchEnabled(request);
     // FastMCP invokes `authenticate(undefined)` for the stdio transport
     // because there is no HTTP request context. Without this null guard,
     // accessing `request.headers` throws a TypeError, FastMCP silently
@@ -298,11 +275,26 @@ const server = new FastMCP<SessionData>({
 
     if (process.env.CLOUD_SERVICE === 'true') {
       if (!headerCred) {
+        // Keyless free tier over the hosted MCP: serve it only when a forwarding
+        // secret is configured, we know the end-user's client IP (so the API can
+        // rate-limit per real IP, not the shared server IP), AND that IP still
+        // has free quota. If the IP is out of quota (or keyless is off), fall
+        // through to throw so FastMCP emits the OAuth 401 + WWW-Authenticate
+        // challenge — i.e. prompt the user to connect an account exactly when
+        // their free quota runs out.
+        const clientIp = extractClientIp(request);
+        if (
+          process.env.KEYLESS_PROXY_SECRET &&
+          clientIp &&
+          (await keylessEligible(clientIp))
+        ) {
+          return { firecrawlApiKey: undefined, keylessClientIp: clientIp };
+        }
         throw new Error(
           'Firecrawl credentials required: OAuth access token (Authorization: Bearer fco_...) or API key (x-firecrawl-api-key)'
         );
       }
-      return { firecrawlApiKey: headerCred, research };
+      return { firecrawlApiKey: headerCred };
     }
 
     const credential = headerCred ?? envCred;
@@ -314,10 +306,14 @@ const server = new FastMCP<SessionData>({
       !process.env.FIRECRAWL_API_KEY &&
       !process.env.FIRECRAWL_API_URL
     ) {
+      // No credential and no self-hosted URL: run in keyless mode. scrape and
+      // search work for free (rate-limited per IP) against the Firecrawl cloud;
+      // every other tool needs an API key and will return Unauthorized.
       console.error(
-        'Either FIRECRAWL_API_KEY or FIRECRAWL_API_URL must be provided'
+        'No FIRECRAWL_API_KEY or FIRECRAWL_API_URL set — running in keyless mode. ' +
+          'firecrawl_scrape and firecrawl_search are free (rate-limited per IP) against the Firecrawl cloud; ' +
+          'other tools require an API key (get one free at https://firecrawl.dev).'
       );
-      process.exit(1);
     }
 
     if (httpStreaming && !credential && !process.env.FIRECRAWL_API_URL) {
@@ -327,7 +323,7 @@ const server = new FastMCP<SessionData>({
       process.exit(1);
     }
 
-    return { firecrawlApiKey: credential, research };
+    return { firecrawlApiKey: credential };
   },
   // Lightweight health endpoint for LB checks
   health: {
@@ -569,8 +565,9 @@ server.addTool({
   name: 'firecrawl_scrape',
   annotations: {
     title: 'Scrape a URL',
-    readOnlyHint: SAFE_MODE,
-    openWorldHint: true,
+    readOnlyHint: SAFE_MODE, // Fetches page content only; in cloud/safe mode interactive browser actions are disabled.
+    openWorldHint: true, // Accepts any user-supplied URL on the public web.
+    destructiveHint: false, // Does not modify, delete, or write to external websites.
   },
   description: `
 Scrape content from a single URL with advanced options.
@@ -687,7 +684,6 @@ ${
       string,
       unknown
     >;
-    const client = getClient(session);
     const transformed = transformScrapeParams(
       options as Record<string, unknown>
     );
@@ -697,6 +693,19 @@ ${
     } else {
       log.info('Scraping URL', { url: String(url) });
     }
+    if (isKeylessMode(session)) {
+      const json = await keylessPost(
+        '/v2/scrape',
+        {
+          url: String(url),
+          ...cleaned,
+          origin: ORIGIN,
+        },
+        session
+      );
+      return asText(json?.data ?? json);
+    }
+    const client = getClient(session);
     const res = await client.scrape(String(url), {
       ...cleaned,
       origin: ORIGIN,
@@ -709,8 +718,9 @@ server.addTool({
   name: 'firecrawl_map',
   annotations: {
     title: 'Map a website',
-    readOnlyHint: true,
-    openWorldHint: true,
+    readOnlyHint: true, // Discovers and returns indexed URLs; does not modify the target site.
+    openWorldHint: true, // Operates against arbitrary user-supplied web domains.
+    destructiveHint: false, // Read-only discovery; no deletion or destructive updates.
   },
   description: `
 Map a website to discover all indexed URLs on the site.
@@ -774,8 +784,9 @@ server.addTool({
   name: 'firecrawl_search',
   annotations: {
     title: 'Search the web',
-    readOnlyHint: true,
-    openWorldHint: true,
+    readOnlyHint: true, // Runs a web search and returns results; does not modify external sites.
+    openWorldHint: true, // Searches the open web across arbitrary domains and sources.
+    destructiveHint: false, // Query-only; no destructive side effects on external entities.
   },
   description: `
 Search the web and optionally extract content from search results. This is the most powerful web search tool available, and if available you should always default to using this tool for any web search needs.
@@ -867,7 +878,6 @@ The query also supports search operators, that you can use if needed to refine t
     args: unknown,
     { session, log }: { session?: SessionData; log: Logger }
   ): Promise<string> => {
-    const client = getClient(session);
     const { query, ...opts } = args as Record<string, unknown>;
 
     const searchOpts = { ...opts } as Record<string, unknown>;
@@ -889,16 +899,22 @@ The query also supports search operators, that you can use if needed to refine t
       excludeDomains
     );
     log.info('Searching', { query: searchQuery });
+    const searchBody = {
+      query: searchQuery,
+      ...(cleaned as any),
+      origin: ORIGIN,
+    };
+    if (isKeylessMode(session)) {
+      const json = await keylessPost('/v2/search', searchBody, session);
+      return asText(json ?? {});
+    }
     // Call /v2/search through the SDK's HTTP layer (auth + retries) instead
     // of `client.search()` so we preserve the full response envelope. The
     // high-level `search()` helper strips `id` and `creditsUsed`, which
     // breaks the `firecrawl_search_feedback` workflow that this server
     // explicitly tells the LLM to use after every search.
-    const httpRes = await (client as any).http.post('/v2/search', {
-      query: searchQuery,
-      ...(cleaned as any),
-      origin: ORIGIN,
-    });
+    const client = getClient(session);
+    const httpRes = await (client as any).http.post('/v2/search', searchBody);
     return asText(httpRes?.data ?? {});
   },
 });
@@ -912,14 +928,126 @@ function resolveApiBaseUrl(): string {
   );
 }
 
-const SEARCH_FEEDBACK_DISABLED = ['1', 'true', 'yes', 'on'].includes(
-  (
-    process.env.FIRECRAWL_NO_SEARCH_FEEDBACK ||
-    process.env.FIRECRAWL_DISABLE_SEARCH_FEEDBACK ||
-    ''
-  )
-    .trim()
-    .toLowerCase()
+// Keyless free tier: when no credential is configured and we're targeting the
+// Firecrawl cloud (not self-hosted via FIRECRAWL_API_URL, not the multi-tenant
+// CLOUD_SERVICE deployment), scrape and search are free, rate-limited per IP.
+// The cloud only grants this when NO Authorization header is sent, so we bypass
+// the SDK — which always attaches a Bearer header — and post directly.
+/** Best-effort end-user client IP from the incoming MCP request headers. */
+function extractClientIp(request?: {
+  headers: IncomingHttpHeaders;
+}): string | undefined {
+  const xff = request?.headers?.['x-forwarded-for'];
+  const raw = Array.isArray(xff) ? xff[0] : xff;
+  const first = typeof raw === 'string' ? raw.split(',')[0].trim() : undefined;
+  return first || undefined;
+}
+
+/**
+ * Read-only check (no quota consumed) of whether a client IP can still use the
+ * keyless free tier, via the API's secret-gated eligibility endpoint. Fails
+ * closed: anything other than a clear "eligible: true" means fall through to the
+ * OAuth challenge rather than silently granting keyless.
+ */
+async function keylessEligible(clientIp: string): Promise<boolean> {
+  const secret = process.env.KEYLESS_PROXY_SECRET;
+  if (!secret) return false;
+  try {
+    const response = await fetch(
+      `${resolveApiBaseUrl()}/v2/keyless/eligibility`,
+      {
+        headers: {
+          'x-firecrawl-keyless-ip': clientIp,
+          'x-firecrawl-keyless-secret': secret,
+        },
+      }
+    );
+    if (!response.ok) return false;
+    const json: any = await response.json().catch(() => ({}));
+    return json?.eligible === true;
+  } catch {
+    return false;
+  }
+}
+
+function isKeylessMode(session?: SessionData): boolean {
+  if (session?.firecrawlApiKey) return false;
+  if (process.env.CLOUD_SERVICE === 'true') {
+    // Hosted: keyless only for secret-gated sessions carrying the forwarded
+    // client IP (so the per-IP cap is meaningful, not the shared server IP).
+    return !!session?.keylessClientIp;
+  }
+  // Local/stdio against the cloud (not a self-hosted FIRECRAWL_API_URL).
+  return !process.env.FIRECRAWL_API_URL;
+}
+
+async function keylessPost(
+  path: string,
+  body: Record<string, unknown>,
+  session?: SessionData
+): Promise<any> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  // Forward the real client IP (secret-authenticated) when proxying keyless
+  // requests through the hosted MCP, so the API rate-limits per real IP.
+  if (session?.keylessClientIp && process.env.KEYLESS_PROXY_SECRET) {
+    headers['x-firecrawl-keyless-ip'] = session.keylessClientIp;
+    headers['x-firecrawl-keyless-secret'] = process.env.KEYLESS_PROXY_SECRET;
+  }
+  const response = await fetch(`${resolveApiBaseUrl()}${path}`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+  const json: any = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(
+      json?.error || `Firecrawl request failed (HTTP ${response.status})`
+    );
+  }
+  return json;
+}
+
+const feedbackIssueSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(80)
+  .regex(
+    /^[a-z0-9][a-z0-9_-]*$/,
+    'Issue codes must use lowercase letters, numbers, underscores, or hyphens'
+  );
+
+const valuableSourceSchema = z.object({
+  url: z.string().url(),
+  reason: z.string().max(1000).optional(),
+});
+
+const missingContentSchema = z.object({
+  topic: z
+    .string()
+    .min(1, 'topic must not be empty')
+    .max(200, 'topic must be 200 characters or fewer'),
+  description: z.string().max(2000).optional(),
+});
+
+const FEEDBACK_DISABLED_VALUES = new Set(['1', 'true', 'yes', 'on']);
+
+function feedbackEnvEnabled(...keys: string[]): boolean {
+  return keys.some((key) =>
+    FEEDBACK_DISABLED_VALUES.has((process.env[key] || '').trim().toLowerCase())
+  );
+}
+
+const SEARCH_FEEDBACK_DISABLED = feedbackEnvEnabled(
+  'FIRECRAWL_NO_SEARCH_FEEDBACK',
+  'FIRECRAWL_DISABLE_SEARCH_FEEDBACK'
+);
+
+const ENDPOINT_FEEDBACK_DISABLED = feedbackEnvEnabled(
+  'FIRECRAWL_NO_ENDPOINT_FEEDBACK',
+  'FIRECRAWL_DISABLE_ENDPOINT_FEEDBACK'
 );
 
 if (SEARCH_FEEDBACK_DISABLED) {
@@ -933,8 +1061,9 @@ if (!SEARCH_FEEDBACK_DISABLED) {
     name: 'firecrawl_search_feedback',
     annotations: {
       title: 'Send feedback on a search result',
-      readOnlyHint: false,
-      openWorldHint: true,
+      readOnlyHint: false, // POSTs structured feedback to the API, creating a server-side record.
+      openWorldHint: true, // Feedback references open-web search results and external URLs.
+      destructiveHint: false, // Additive only; records feedback and may refund credits, does not delete data.
     },
     description: `
 Send structured feedback on a previous \`firecrawl_search\` result. **Call this immediately after a search where you used the results** so we can improve search quality and refund 1 credit (search costs 2).
@@ -1112,13 +1241,152 @@ Pass the \`searchId\` returned by \`firecrawl_search\` (the \`id\` field on the 
   });
 }
 
+if (ENDPOINT_FEEDBACK_DISABLED) {
+  console.error(
+    '[firecrawl-mcp] Endpoint feedback tool disabled by FIRECRAWL_NO_ENDPOINT_FEEDBACK; firecrawl_feedback will not be registered.'
+  );
+}
+
+if (!ENDPOINT_FEEDBACK_DISABLED) {
+  server.addTool({
+    name: 'firecrawl_feedback',
+    annotations: {
+      title: 'Send feedback on a Firecrawl job',
+      readOnlyHint: false, // POSTs structured feedback for a completed job to /v2/feedback.
+      openWorldHint: true, // Feedback is tied to jobs that processed open-web URLs.
+      destructiveHint: false, // Additive only; submits ratings and notes, does not delete jobs or external content.
+    },
+    description: `
+Send structured feedback for a completed Firecrawl v2 job. Use this for endpoint-level feedback on \`scrape\`, \`parse\`, \`map\`, or \`search\` jobs when the job result was useful, partially useful, or failed to meet expectations.
+
+For search-result quality specifically, prefer \`firecrawl_search_feedback\` when available because it has search-focused guidance. This generic tool posts to \`/v2/feedback\` and accepts endpoint-wide signals:
+
+- **endpoint** — one of \`search\`, \`scrape\`, \`parse\`, or \`map\`.
+- **jobId** — the id returned by that endpoint.
+- **rating** — overall result quality: \`good\`, \`partial\`, or \`bad\`.
+- **issues** — stable lowercase issue codes such as \`missing_markdown\`, \`bad_pdf_parse\`, or \`wrong_links\`.
+- **tags** — optional lowercase tags for grouping feedback.
+- **note** — short human-readable context. Do not include huge page contents or raw scrape results.
+- **url**, **pageNumbers**, and **metadata** — small contextual fields that identify what the feedback refers to.
+
+Do not store multi-MB outputs in feedback. Use concise notes, issue codes, URLs, and page numbers.
+
+**Returns:** \`{ success, feedbackId, creditsRefunded, creditsRefundedToday?, dailyRefundCap?, dailyCapReached?, alreadySubmitted?, warning? }\` JSON.
+`,
+    parameters: z.object({
+      endpoint: z.enum(['search', 'scrape', 'parse', 'map']),
+      jobId: z.string().uuid('jobId must be the UUID returned by Firecrawl'),
+      rating: z.enum(['good', 'bad', 'partial']),
+      issues: z.array(feedbackIssueSchema).max(20).optional(),
+      tags: z.array(feedbackIssueSchema).max(20).optional(),
+      note: z.string().max(4000).optional(),
+      valuableSources: z.array(valuableSourceSchema).max(50).optional(),
+      missingContent: z.array(missingContentSchema).max(50).optional(),
+      querySuggestions: z.string().max(2000).optional(),
+      url: z.string().url().optional(),
+      pageNumbers: z.array(z.number().int().positive()).max(100).optional(),
+      metadata: z.record(z.string(), z.unknown()).optional(),
+    }),
+    execute: async (
+      args: unknown,
+      { session, log }: { session?: SessionData; log: Logger }
+    ): Promise<string> => {
+      const {
+        endpoint,
+        jobId,
+        rating,
+        issues,
+        tags,
+        note,
+        valuableSources,
+        missingContent,
+        querySuggestions,
+        url,
+        pageNumbers,
+        metadata,
+      } = args as {
+        endpoint: 'search' | 'scrape' | 'parse' | 'map';
+        jobId: string;
+        rating: 'good' | 'bad' | 'partial';
+        issues?: string[];
+        tags?: string[];
+        note?: string;
+        valuableSources?: { url: string; reason?: string }[];
+        missingContent?: { topic: string; description?: string }[];
+        querySuggestions?: string;
+        url?: string;
+        pageNumbers?: number[];
+        metadata?: Record<string, unknown>;
+      };
+
+      const apiBase = resolveApiBaseUrl();
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      };
+      const apiKey = session?.firecrawlApiKey;
+      if (apiKey) {
+        headers['Authorization'] = `Bearer ${apiKey}`;
+      } else if (process.env.CLOUD_SERVICE === 'true') {
+        throw new Error('Unauthorized: missing API key for feedback.');
+      }
+
+      const body = removeEmptyTopLevel({
+        endpoint,
+        jobId,
+        rating,
+        issues,
+        tags,
+        note,
+        valuableSources,
+        missingContent,
+        querySuggestions,
+        url,
+        pageNumbers,
+        metadata,
+        origin: ORIGIN,
+      });
+
+      log.info('Submitting endpoint feedback', { endpoint, jobId, rating });
+      const response = await fetch(`${apiBase}/v2/feedback`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+      });
+
+      const responseText = await response.text();
+      let parsed: any;
+      try {
+        parsed = JSON.parse(responseText);
+      } catch {
+        parsed = { raw: responseText };
+      }
+
+      if (!response.ok) {
+        log.warn('Endpoint feedback rejected', {
+          status: response.status,
+          feedbackErrorCode: parsed?.feedbackErrorCode,
+        });
+        return asText({
+          success: false,
+          status: response.status,
+          feedbackErrorCode: parsed?.feedbackErrorCode,
+          error: parsed?.error ?? `HTTP ${response.status}`,
+          retryable: response.status >= 500,
+        });
+      }
+
+      return asText(parsed);
+    },
+  });
+}
+
 server.addTool({
   name: 'firecrawl_crawl',
   annotations: {
     title: 'Start a site crawl',
-    readOnlyHint: false,
-    openWorldHint: true,
-    destructiveHint: false,
+    readOnlyHint: false, // Starts an asynchronous crawl job, creating a persistent server-side job.
+    openWorldHint: true, // Crawls user-specified URLs across the public web.
+    destructiveHint: false, // Reads pages from target sites; does not delete or alter external websites.
   },
   description: `
  Starts a crawl job on a website and extracts content from all pages.
@@ -1201,8 +1469,9 @@ server.addTool({
   name: 'firecrawl_check_crawl_status',
   annotations: {
     title: 'Get crawl status',
-    readOnlyHint: true,
-    openWorldHint: false,
+    readOnlyHint: true, // Retrieves status and results for an existing crawl job by ID; no mutations.
+    openWorldHint: false, // Queries only Firecrawl job state within the authenticated account.
+    destructiveHint: false, // Status lookup only; no deletes or updates.
   },
   description: `
 Check the status of a crawl job.
@@ -1233,8 +1502,9 @@ server.addTool({
   name: 'firecrawl_extract',
   annotations: {
     title: 'Extract structured data',
-    readOnlyHint: true,
-    openWorldHint: true,
+    readOnlyHint: true, // Uses LLM extraction to pull structured data from URLs without modifying those sites.
+    openWorldHint: true, // Accepts arbitrary user-supplied URLs on the public web.
+    destructiveHint: false, // Read-only extraction; no destructive changes to external content.
   },
   description: `
 Extract structured information from web pages using LLM capabilities. Supports both cloud AI and self-hosted LLM extraction.
@@ -1308,9 +1578,9 @@ server.addTool({
   name: 'firecrawl_agent',
   annotations: {
     title: 'Start a research agent',
-    readOnlyHint: false,
-    openWorldHint: true,
-    destructiveHint: false,
+    readOnlyHint: false, // Starts an autonomous research agent job on the Firecrawl API.
+    openWorldHint: true, // The agent browses and searches the open web to fulfill the prompt.
+    destructiveHint: false, // Gathers information only; does not delete external data or user resources.
   },
   description: `
 Autonomous web research agent. This is a separate AI agent layer that independently browses the internet, searches for information, navigates through pages, and extracts structured data based on your query. You describe what you need, and the agent figures out where to find it.
@@ -1413,8 +1683,9 @@ server.addTool({
   name: 'firecrawl_agent_status',
   annotations: {
     title: 'Get agent job status',
-    readOnlyHint: true,
-    openWorldHint: false,
+    readOnlyHint: true, // Polls an existing agent job by ID for progress and results; no mutations.
+    openWorldHint: false, // Queries only Firecrawl job state by job ID within the user's account.
+    destructiveHint: false, // Read-only status check.
   },
   description: `
 Check the status of an agent job and retrieve results when complete. Use this to poll for results after starting an agent with \`firecrawl_agent\`.
@@ -1459,9 +1730,9 @@ server.addTool({
   name: 'firecrawl_interact',
   annotations: {
     title: 'Interact with a scraped page',
-    readOnlyHint: false,
-    openWorldHint: true,
-    destructiveHint: false,
+    readOnlyHint: false, // Executes browser interactions (clicks, form input, scripts) in a live session.
+    openWorldHint: true, // Interacts with pages on the public web via the scraped session.
+    destructiveHint: false, // Transient page interactions only; does not delete monitors, jobs, or external sites.
   },
   description: `
 Interact with a previously scraped page in a live browser session. Scrape a page first with firecrawl_scrape, then use the returned scrapeId to click buttons, fill forms, extract dynamic content, or navigate deeper.
@@ -1538,9 +1809,9 @@ server.addTool({
   name: 'firecrawl_interact_stop',
   annotations: {
     title: 'Stop interact session',
-    readOnlyHint: false,
-    openWorldHint: false,
-    destructiveHint: true,
+    readOnlyHint: false, // Calls the API to stop and tear down an active interact session.
+    openWorldHint: false, // Operates only on a known Firecrawl scrape/interact session ID.
+    destructiveHint: true, // Terminates the live browser session; this end state cannot be resumed.
   },
   description: `
 Stop an interact session for a scraped page. Call this when you are done interacting to free resources.
@@ -1654,8 +1925,9 @@ if (process.env.CLOUD_SERVICE !== 'true') {
     name: 'firecrawl_parse',
     annotations: {
       title: 'Parse a local file',
-      readOnlyHint: true,
-      openWorldHint: false,
+      readOnlyHint: true, // Reads and parses a local file; does not modify the file on disk.
+      openWorldHint: false, // Operates on a local filesystem path, not the open web.
+      destructiveHint: false, // Read-only parsing; no deletion or writes to the source file.
     },
     description: `
 Parse a file from the local filesystem using a self-hosted Firecrawl API's /v2/parse endpoint.
@@ -1838,21 +2110,6 @@ if (
 }
 
 registerMonitorTools(server);
-
-// Research tools gating. FastMCP's `canAccess` is only honored on the HTTP
-// transport (the stdio path exposes every registered tool regardless), so we
-// split the two cases:
-//   - HTTP (cloud / SSE_LOCAL / HTTP_STREAMABLE_SERVER): always register; each
-//     tool's `canAccess` hides it unless the session has research enabled
-//     (`FIRECRAWL_RESEARCH=true` env or `?research=true` on the request).
-//   - stdio (local): register only when `FIRECRAWL_RESEARCH=true`, since
-//     `canAccess` cannot hide them there.
-const isHttpTransport =
-  process.env.CLOUD_SERVICE === 'true' ||
-  process.env.SSE_LOCAL === 'true' ||
-  process.env.HTTP_STREAMABLE_SERVER === 'true';
-if (isHttpTransport || process.env.FIRECRAWL_RESEARCH === 'true') {
-  registerResearchTools(server, getClient);
-}
+registerResearchTools(server, getClient);
 
 await server.start(args);
