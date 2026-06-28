@@ -10,8 +10,8 @@
  * `/v2/search`.
  */
 
-import type { FastMCP, Logger } from 'firecrawl-fastmcp';
 import { z } from 'zod';
+import type { FastMCP } from './fastmcp/FastMCP';
 
 interface SessionData {
   firecrawlApiKey?: string;
@@ -33,6 +33,7 @@ type ClientLike = {
 type GetClient = (session?: SessionData) => unknown;
 
 const BASE = '/v2/search/research';
+const ORIGIN_HEADERS = { 'X-Origin': 'mcp-fastmcp' };
 
 /** Append a value (or repeated array values) to a URLSearchParams instance. */
 function appendParam(
@@ -272,10 +273,7 @@ export function registerResearchTools(
           'Inclusive upper bound on created/updated date (`YYYY-MM-DD`).'
         ),
     }),
-    execute: async (
-      args: unknown,
-      { session }: { session?: SessionData; log: Logger }
-    ): Promise<string> => {
+    execute: async (args: unknown, { session }): Promise<string> => {
       const { query, k, authors, categories, from, to } = args as {
         query: string;
         k?: number;
@@ -293,7 +291,8 @@ export function registerResearchTools(
       appendParam(params, 'to', to);
       const client = getClient(session) as ClientLike;
       const res = await client.http.get<{ results?: PaperHit[] }>(
-        withQuery(`${BASE}/papers`, params)
+        withQuery(`${BASE}/papers`, params),
+        ORIGIN_HEADERS
       );
       return fmtHits(res.data?.results);
     },
@@ -320,14 +319,12 @@ export function registerResearchTools(
           'Canonical paperId or primaryId such as `arxiv:1706.03762`, `pmcid:PMC12530322`, `pmid:40953549`, or `doi:10.1016/j.neunet.2025.108095`.'
         ),
     }),
-    execute: async (
-      args: unknown,
-      { session }: { session?: SessionData; log: Logger }
-    ): Promise<string> => {
+    execute: async (args: unknown, { session }): Promise<string> => {
       const { paperId } = args as { paperId: string };
       const client = getClient(session) as ClientLike;
       const res = await client.http.get<{ paper?: PaperHit }>(
-        `${BASE}/papers/${encodeURIComponent(paperId)}`
+        `${BASE}/papers/${encodeURIComponent(paperId)}`,
+        ORIGIN_HEADERS
       );
       return fmtPaperMetadata(res.data?.paper);
     },
@@ -361,10 +358,7 @@ export function registerResearchTools(
         .optional()
         .describe('Apply an additional rerank over the fused candidates.'),
     }),
-    execute: async (
-      args: unknown,
-      { session }: { session?: SessionData; log: Logger }
-    ): Promise<string> => {
+    execute: async (args: unknown, { session }): Promise<string> => {
       const { seed_ids, intent, mode, k, rerank } = args as {
         seed_ids: string[];
         intent: string;
@@ -390,7 +384,8 @@ export function registerResearchTools(
         withQuery(
           `${BASE}/papers/${encodeURIComponent(primary)}/similar`,
           params
-        )
+        ),
+        ORIGIN_HEADERS
       );
       const note = res.data?.note ? `\nnote: ${res.data.note}` : '';
       return `${fmtHits(res.data?.results)}\n(poolSize=${res.data?.poolSize ?? 0})${note}`;
@@ -427,10 +422,7 @@ export function registerResearchTools(
         .optional()
         .describe('Number of passages to return (default 4).'),
     }),
-    execute: async (
-      args: unknown,
-      { session }: { session?: SessionData; log: Logger }
-    ): Promise<string> => {
+    execute: async (args: unknown, { session }): Promise<string> => {
       const { paperId, question, k } = args as {
         paperId: string;
         question: string;
@@ -441,7 +433,8 @@ export function registerResearchTools(
       appendParam(params, 'k', k);
       const client = getClient(session) as ClientLike;
       const res = await client.http.get<{ passages?: { text: string }[] }>(
-        withQuery(`${BASE}/papers/${encodeURIComponent(paperId)}`, params)
+        withQuery(`${BASE}/papers/${encodeURIComponent(paperId)}`, params),
+        ORIGIN_HEADERS
       );
       const passages = res.data?.passages ?? [];
       return passages.length
@@ -466,17 +459,15 @@ export function registerResearchTools(
       query: z.string().min(1),
       k: z.number().int().min(1).max(100).optional(),
     }),
-    execute: async (
-      args: unknown,
-      { session }: { session?: SessionData; log: Logger }
-    ): Promise<string> => {
+    execute: async (args: unknown, { session }): Promise<string> => {
       const { query, k } = args as { query: string; k?: number };
       const params = new URLSearchParams();
       appendParam(params, 'query', query);
       appendParam(params, 'k', k);
       const client = getClient(session) as ClientLike;
       const res = await client.http.get<{ results?: GitHubItem[] }>(
-        withQuery(`${BASE}/github`, params)
+        withQuery(`${BASE}/github`, params),
+        ORIGIN_HEADERS
       );
       return fmtGithub(res.data?.results);
     },

@@ -9,8 +9,8 @@
  * — same pattern the CLI uses.
  */
 
-import type { FastMCP, Logger } from 'firecrawl-fastmcp';
 import { z } from 'zod';
+import type { FastMCP } from './fastmcp/FastMCP';
 
 interface SessionData {
   firecrawlApiKey?: string;
@@ -25,9 +25,15 @@ interface MonitorRequestInit {
   query?: Record<string, string | number | undefined>;
 }
 
-function resolveAuth(session?: SessionData): { apiKey?: string; baseUrl: string } {
+function resolveAuth(session?: SessionData): {
+  apiKey?: string;
+  baseUrl: string;
+} {
   const apiKey = session?.firecrawlApiKey ?? process.env.FIRECRAWL_API_KEY;
-  const baseUrl = (process.env.FIRECRAWL_API_URL ?? DEFAULT_API_URL).replace(/\/$/, '');
+  const baseUrl = (process.env.FIRECRAWL_API_URL ?? DEFAULT_API_URL).replace(
+    /\/$/,
+    ''
+  );
   return { apiKey, baseUrl };
 }
 
@@ -51,7 +57,7 @@ async function monitorRequest(
     if (s) url += `?${s}`;
   }
 
-  const headers: Record<string, string> = { 'X-Origin': 'mcp' };
+  const headers: Record<string, string> = { 'X-Origin': 'mcp-fastmcp' };
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
   if (init.body !== undefined) headers['Content-Type'] = 'application/json';
 
@@ -90,19 +96,32 @@ const checkStatusSchema = z.enum([
 function splitPages(page?: string, pages?: string[]): string[] {
   return [page, ...(pages ?? [])]
     .filter((url): url is string => typeof url === 'string')
-    .map(url => url.trim())
+    .map((url) => url.trim())
     .filter(Boolean);
 }
 
-function buildMonitorCreateBody(args: Record<string, unknown>): Record<string, unknown> {
+function buildMonitorCreateBody(
+  args: Record<string, unknown>
+): Record<string, unknown> {
   if (args.body && typeof args.body === 'object' && !Array.isArray(args.body)) {
     return args.body as Record<string, unknown>;
   }
 
-  const urls = splitPages(args.page as string | undefined, args.pages as string[] | undefined);
-  if (urls.length === 0) {
+  const urls = splitPages(
+    args.page as string | undefined,
+    args.pages as string[] | undefined
+  );
+  const queries = Array.isArray(args.queries)
+    ? (args.queries as unknown[])
+        .filter((q): q is string => typeof q === 'string')
+        .map((q) => q.trim())
+        .filter(Boolean)
+    : [];
+  const isSearch = queries.length > 0;
+
+  if (urls.length === 0 && !isSearch) {
     throw new Error(
-      'firecrawl_monitor_create requires either `body`, `page`, or `pages`.'
+      'firecrawl_monitor_create requires either `body`, `page`/`pages`, or `queries`.'
     );
   }
 
@@ -111,6 +130,35 @@ function buildMonitorCreateBody(args: Record<string, unknown>): Record<string, u
     throw new Error(
       'firecrawl_monitor_create shorthand requires `goal`. Use `body` for advanced requests without a goal.'
     );
+  }
+
+  // Build the target: search when `queries` are given, otherwise a scrape.
+  let target: Record<string, unknown>;
+  if (isSearch) {
+    const includeDomains = Array.isArray(args.includeDomains)
+      ? (args.includeDomains as unknown[]).filter(
+          (d): d is string => typeof d === 'string'
+        )
+      : undefined;
+    const excludeDomains = Array.isArray(args.excludeDomains)
+      ? (args.excludeDomains as unknown[]).filter(
+          (d): d is string => typeof d === 'string'
+        )
+      : undefined;
+    target = {
+      type: 'search',
+      queries,
+      ...(typeof args.searchWindow === 'string' && args.searchWindow.trim()
+        ? { searchWindow: args.searchWindow.trim() }
+        : {}),
+      ...(typeof args.maxResults === 'number'
+        ? { maxResults: args.maxResults }
+        : {}),
+      ...(includeDomains && includeDomains.length > 0 ? { includeDomains } : {}),
+      ...(excludeDomains && excludeDomains.length > 0 ? { excludeDomains } : {}),
+    };
+  } else {
+    target = { type: 'scrape', urls };
   }
 
   const webhookUrl =
@@ -130,7 +178,9 @@ function buildMonitorCreateBody(args: Record<string, unknown>): Record<string, u
     name:
       typeof args.name === 'string' && args.name.trim()
         ? args.name.trim()
-        : `Monitor ${urls[0]}`,
+        : isSearch
+          ? `Monitor ${queries[0]}`
+          : `Monitor ${urls[0]}`,
     schedule: {
       text:
         typeof args.scheduleText === 'string' && args.scheduleText.trim()
@@ -142,7 +192,7 @@ function buildMonitorCreateBody(args: Record<string, unknown>): Record<string, u
           : 'UTC',
     },
     goal,
-    targets: [{ type: 'scrape', urls }],
+    targets: [target],
     ...(email ? { notification: email } : {}),
     ...(webhookUrl
       ? {
@@ -165,19 +215,37 @@ export function registerMonitorTools(server: FastMCP<SessionData>): void {
       destructiveHint: false, // Additive; creates a new monitor without deleting existing monitors or external content.
     },
     description: `
-Create a Firecrawl monitor — a recurring scrape or crawl that diffs each result against the last retained snapshot.
+Create a Firecrawl monitor — a recurring scrape, crawl, or search that diffs each result against the last retained snapshot.
 
-Prefer the simple path: pass \`page\` or \`pages\` plus \`goal\`. The tool will create a scrape monitor with a 30-minute schedule and meaningful-change judging enabled by the API. Use \`body\` only for advanced requests such as crawl targets, JSON change tracking, custom retention, or manual \`judgeEnabled\` control.
+Prefer the simple path: pass \`page\` or \`pages\` plus \`goal\` to monitor specific URLs, OR pass \`queries\` plus \`goal\` to monitor web search results for new/changed hits. The tool will create the monitor with a 30-minute schedule and meaningful-change judging enabled by the API. Use \`body\` only for advanced requests such as crawl targets, JSON change tracking, custom retention, or manual \`judgeEnabled\` control.
 
 Meaningful-change judge: set \`goal\` to a plain-language description of what the user actually cares about. \`judgeEnabled\` defaults to true when \`goal\` is set, so providing \`goal\` is enough. Page webhooks expose \`isMeaningful\` and \`judgment\` on \`monitor.page\` events.
 
 Simple fields:
 - \`page\`: one page URL to monitor.
 - \`pages\`: multiple page URLs to monitor.
-- \`goal\`: plain-English instruction for what changes matter. Required for the simple path.
+- \`queries\`: one or more search queries (1-12) to monitor instead of fixed URLs. Each check runs the searches and diffs the result set, so you get alerted when new or changed results appear. Mutually exclusive with \`page\`/\`pages\` in the simple path.
+- \`searchWindow\`: optional recency window for search targets — one of \`5m\`, \`15m\`, \`1h\`, \`6h\`, \`24h\`, \`7d\` (default \`24h\`).
+- \`maxResults\`: optional max results per search, 1-50 (default 10).
+- \`includeDomains\` / \`excludeDomains\`: optional domain allow/deny lists for search targets.
+- \`goal\`: plain-English instruction for what changes matter. Required for the simple path (and always required when \`queries\` are set — web monitors must have a goal).
 - \`scheduleText\`: optional natural-language schedule, default \`every 30 minutes\`.
 - \`email\`: optional email recipient for summaries.
 - \`webhookUrl\`: optional webhook URL. Configures \`monitor.page\` and \`monitor.check.completed\`.
+
+**Search-mode example:**
+
+\`\`\`json
+{
+  "name": "firecrawl_monitor_create",
+  "arguments": {
+    "queries": ["new LLM release", "frontier model launch"],
+    "goal": "Notify me about major new LLM model releases.",
+    "searchWindow": "24h",
+    "maxResults": 10
+  }
+}
+\`\`\`
 
 Goal guidance:
 - Expand the user's one-line monitoring intent into a concise 2-3 sentence monitor goal.
@@ -187,7 +255,7 @@ Goal guidance:
 - If the user says they do not care about something, include that explicitly. It is okay to ask whether they want to ignore specific noise when it is likely to matter.
 - Do not invent page-specific sections, thresholds, entities, or business rules unless the user mentioned them.
 
-Full \`body\` requests require: \`name\`, \`schedule\` (with \`cron\` or \`text\`), and \`targets\` (one or more \`{ type: 'scrape', urls: [...] }\` or \`{ type: 'crawl', url: '...' }\`). Optional: \`goal\`, \`judgeEnabled\`, \`webhook\`, \`notification\`, \`retentionDays\`.
+Full \`body\` requests require: \`name\`, \`schedule\` (with \`cron\` or \`text\`), and \`targets\` (one or more \`{ type: 'scrape', urls: [...] }\`, \`{ type: 'crawl', url: '...' }\`, or \`{ type: 'search', queries: [...], searchWindow?, maxResults?, includeDomains?, excludeDomains? }\`). Optional: \`goal\` (required when any search target is present), \`judgeEnabled\`, \`webhook\`, \`notification\`, \`retentionDays\`.
 
 **Markdown-mode (default):** Each check produces a unified text diff of the page's markdown. No extra configuration needed.
 
@@ -263,6 +331,11 @@ Full \`body\` requests require: \`name\`, \`schedule\` (with \`cron\` or \`text\
       body: z.record(z.string(), z.any()).optional(),
       page: z.string().optional(),
       pages: z.array(z.string()).optional(),
+      queries: z.array(z.string()).optional(),
+      searchWindow: z.enum(['5m', '15m', '1h', '6h', '24h', '7d']).optional(),
+      maxResults: z.number().int().min(1).max(50).optional(),
+      includeDomains: z.array(z.string()).optional(),
+      excludeDomains: z.array(z.string()).optional(),
       goal: z.string().optional(),
       name: z.string().optional(),
       scheduleText: z.string().optional(),
@@ -271,12 +344,9 @@ Full \`body\` requests require: \`name\`, \`schedule\` (with \`cron\` or \`text\
       includeDiffs: z.boolean().optional(),
       webhookUrl: z.string().optional(),
     }),
-    execute: async (
-      args: unknown,
-      { session, log }: { session?: SessionData; log: Logger }
-    ): Promise<string> => {
+    execute: async (args: unknown, { session, log }): Promise<string> => {
       const body = buildMonitorCreateBody(args as Record<string, unknown>);
-      log.info('Creating monitor', { name: body.name });
+      log.info('Creating monitor', { name: String(body.name) });
       const res = await monitorRequest(session, '/monitor', {
         method: 'POST',
         body,
@@ -305,10 +375,7 @@ List all Firecrawl monitors for the authenticated account.
       limit: z.number().int().positive().optional(),
       offset: z.number().int().nonnegative().optional(),
     }),
-    execute: async (
-      args: unknown,
-      { session }: { session?: SessionData }
-    ): Promise<string> => {
+    execute: async (args: unknown, { session, log }): Promise<string> => {
       const { limit, offset } = args as { limit?: number; offset?: number };
       const res = await monitorRequest(session, '/monitor', {
         query: { limit, offset },
@@ -334,10 +401,7 @@ Get a single monitor by ID.
 \`\`\`
 `,
     parameters: z.object({ id: z.string() }),
-    execute: async (
-      args: unknown,
-      { session }: { session?: SessionData }
-    ): Promise<string> => {
+    execute: async (args: unknown, { session, log }): Promise<string> => {
       const { id } = args as { id: string };
       const res = await monitorRequest(
         session,
@@ -373,10 +437,7 @@ Update a monitor. Pass any subset of fields to patch: \`name\`, \`status\` ("act
       id: z.string(),
       body: z.record(z.string(), z.any()),
     }),
-    execute: async (
-      args: unknown,
-      { session }: { session?: SessionData }
-    ): Promise<string> => {
+    execute: async (args: unknown, { session, log }): Promise<string> => {
       const { id, body } = args as {
         id: string;
         body: Record<string, unknown>;
@@ -407,10 +468,7 @@ Permanently delete a monitor and stop its schedule. This cannot be undone.
 \`\`\`
 `,
     parameters: z.object({ id: z.string() }),
-    execute: async (
-      args: unknown,
-      { session, log }: { session?: SessionData; log: Logger }
-    ): Promise<string> => {
+    execute: async (args: unknown, { session, log }): Promise<string> => {
       const { id } = args as { id: string };
       log.info('Deleting monitor', { id });
       const res = await monitorRequest(
@@ -439,10 +497,7 @@ Trigger a monitor check immediately, outside its normal schedule. Returns the qu
 \`\`\`
 `,
     parameters: z.object({ id: z.string() }),
-    execute: async (
-      args: unknown,
-      { session }: { session?: SessionData }
-    ): Promise<string> => {
+    execute: async (args: unknown, { session, log }): Promise<string> => {
       const { id } = args as { id: string };
       const res = await monitorRequest(
         session,
@@ -475,10 +530,7 @@ List historical checks for a monitor.
       offset: z.number().int().nonnegative().optional(),
       status: checkStatusSchema.optional(),
     }),
-    execute: async (
-      args: unknown,
-      { session }: { session?: SessionData }
-    ): Promise<string> => {
+    execute: async (args: unknown, { session, log }): Promise<string> => {
       const { id, limit, offset, status } = args as {
         id: string;
         limit?: number;
@@ -565,10 +617,7 @@ The endpoint paginates via a top-level \`next\` URL; this tool returns one page 
       skip: z.number().int().nonnegative().optional(),
       pageStatus: pageStatusSchema.optional(),
     }),
-    execute: async (
-      args: unknown,
-      { session }: { session?: SessionData }
-    ): Promise<string> => {
+    execute: async (args: unknown, { session, log }): Promise<string> => {
       const { id, checkId, limit, skip, pageStatus } = args as {
         id: string;
         checkId: string;
