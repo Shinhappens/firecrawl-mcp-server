@@ -230,6 +230,76 @@ test('HTTP cloud transport preserves Firecrawl OAuth and well-known routes', asy
   assert.equal(stderr.includes('TypeError'), false, stderr);
 });
 
+test('HTTP cloud transport calls Firecrawl API with authenticated session', async (t) => {
+  const fakeApi = await startFakeFirecrawlApi();
+  t.after(() => fakeApi.close());
+
+  const port = await getFreePort();
+  const child = spawnServer({
+    CLOUD_SERVICE: 'true',
+    FASTMCP_ENDPOINT: '/v2/mcp',
+    FIRECRAWL_API_URL: fakeApi.url,
+    HTTP_STREAMABLE_SERVER: 'true',
+    PORT: String(port),
+  });
+  let stderr = '';
+  child.stderr.on('data', (chunk) => {
+    stderr += chunk;
+  });
+  t.after(() => stopChild(child));
+
+  await waitForHealth(port, child);
+
+  const toolCall = await fetch(`http://127.0.0.1:${port}/v2/mcp`, {
+    body: JSON.stringify({
+      id: 4,
+      jsonrpc: '2.0',
+      method: 'tools/call',
+      params: {
+        arguments: { limit: 1, query: 'example domain' },
+        name: 'firecrawl_search',
+      },
+    }),
+    headers: {
+      accept: 'application/json, text/event-stream',
+      'content-type': 'application/json',
+      'x-api-key': 'fc-http-test',
+    },
+    method: 'POST',
+  });
+  assert.equal(toolCall.status, 200);
+
+  const message = parseSseJson(await toolCall.text());
+  const result = message.result;
+  assert.notEqual(result.isError, true);
+  assert.equal(result.content.length, 1);
+  assert.equal(result.content[0].type, 'text');
+  assert.deepEqual(JSON.parse(result.content[0].text), {
+    creditsUsed: 1,
+    data: {
+      web: [
+        {
+          title: 'Example Domain',
+          url: 'https://example.com/',
+        },
+      ],
+    },
+    id: '00000000-0000-4000-8000-000000000000',
+    success: true,
+  });
+
+  assert.equal(fakeApi.requests.length, 1);
+  assert.equal(fakeApi.requests[0].method, 'POST');
+  assert.equal(fakeApi.requests[0].url, '/v2/search');
+  assert.equal(fakeApi.requests[0].headers.authorization, 'Bearer fc-http-test');
+  assert.deepEqual(fakeApi.requests[0].body, {
+    limit: 1,
+    origin: 'mcp-fastmcp',
+    query: 'example domain',
+  });
+  assert.equal(stderr.includes('TypeError'), false, stderr);
+});
+
 class StdioMcpClient {
   #buffer = '';
   #child;
