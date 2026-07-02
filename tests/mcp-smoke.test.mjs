@@ -38,6 +38,15 @@ async function waitForHealth(port, child) {
   throw lastError ?? new Error('server did not become healthy');
 }
 
+
+function parseSseJson(body) {
+  const dataLine = body
+    .split(/\r?\n/)
+    .find((line) => line.startsWith('data: '));
+  assert.ok(dataLine, `Missing SSE data line in body: ${body}`);
+  return JSON.parse(dataLine.slice('data: '.length));
+}
+
 function spawnServer(env) {
   const child = spawn(process.execPath, ['dist/index.js'], {
     env: { ...process.env, ...env },
@@ -116,6 +125,50 @@ test('HTTP cloud transport preserves Firecrawl OAuth and well-known routes', asy
     error_description:
       'Firecrawl credentials required: OAuth access token (Authorization: Bearer fco_...) or API key (x-firecrawl-api-key)',
   });
+
+  const initialize = await fetch(`http://127.0.0.1:${port}/v2/mcp`, {
+    body: JSON.stringify({
+      id: 2,
+      jsonrpc: '2.0',
+      method: 'initialize',
+      params: {
+        capabilities: {},
+        clientInfo: { name: 'firecrawl-http-smoke', version: '0.0.0' },
+        protocolVersion: '2025-06-18',
+      },
+    }),
+    headers: {
+      accept: 'application/json, text/event-stream',
+      'content-type': 'application/json',
+      'x-api-key': 'fc-test',
+    },
+    method: 'POST',
+  });
+  assert.equal(initialize.status, 200);
+  assert.match(initialize.headers.get('content-type') ?? '', /text\/event-stream/);
+  const initializeMessage = parseSseJson(await initialize.text());
+  assert.equal(initializeMessage.result.serverInfo.name, 'firecrawl-fastmcp');
+
+  const toolsList = await fetch(`http://127.0.0.1:${port}/v2/mcp`, {
+    body: JSON.stringify({
+      id: 3,
+      jsonrpc: '2.0',
+      method: 'tools/list',
+      params: {},
+    }),
+    headers: {
+      accept: 'application/json, text/event-stream',
+      'content-type': 'application/json',
+      'x-api-key': 'fc-test',
+    },
+    method: 'POST',
+  });
+  assert.equal(toolsList.status, 200);
+  const toolsMessage = parseSseJson(await toolsList.text());
+  const httpToolNames = toolsMessage.result.tools.map((tool) => tool.name);
+  assert.ok(httpToolNames.includes('firecrawl_scrape'));
+  assert.ok(httpToolNames.includes('firecrawl_search'));
+  assert.ok(httpToolNames.includes('firecrawl_parse'));
 
   assert.equal(stderr.includes('TypeError'), false, stderr);
 });
