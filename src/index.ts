@@ -781,8 +781,11 @@ type ParseToolArgs = {
 } & Record<string, unknown>;
 
 function extractParseOptions(args: ParseToolArgs): Record<string, unknown> {
-  const { filePath, uploadRef, contentType, declaredSizeBytes, ...options } =
-    args;
+  const options = { ...args };
+  delete options.filePath;
+  delete options.uploadRef;
+  delete options.contentType;
+  delete options.declaredSizeBytes;
   return options;
 }
 
@@ -1232,7 +1235,7 @@ Search the web and optionally extract content from search results. This is the m
 The query also supports search operators, that you can use if needed to refine the search:
 | Operator | Functionality | Examples |
 ---|-|-|
-| \`"\"\` | Non-fuzzy matches a string of text | \`"Firecrawl"\`
+| \`"\` | Non-fuzzy matches a string of text | \`"Firecrawl"\`
 | \`-\` | Excludes certain keywords or negates other operators | \`-bad\`, \`-site:firecrawl.dev\`
 | \`site:\` | Only returns results from a specified website | \`site:firecrawl.dev\`
 | \`inurl:\` | Only returns results that include a word in the URL | \`inurl:firecrawl\`
@@ -1514,7 +1517,7 @@ async function waitForCrawlCompletionWithOrigin(
   timeout?: number
 ): Promise<Record<string, unknown>> {
   const startedAt = Date.now();
-  while (true) {
+  for (;;) {
     const status = await getCrawlStatusWithOrigin(client, jobId);
     if (
       ['completed', 'failed', 'cancelled'].includes(String(status.status ?? ''))

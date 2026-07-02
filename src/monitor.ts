@@ -382,7 +382,7 @@ List all Firecrawl monitors for the authenticated account.
       limit: z.number().int().positive().optional(),
       offset: z.number().int().nonnegative().optional(),
     }),
-    execute: async (args: unknown, { session, log }): Promise<string> => {
+    execute: async (args: unknown, { session }): Promise<string> => {
       const { limit, offset } = args as { limit?: number; offset?: number };
       const res = await monitorRequest(session, '/monitor', {
         query: { limit, offset },
@@ -408,7 +408,7 @@ Get a single monitor by ID.
 \`\`\`
 `,
     parameters: z.object({ id: z.string() }),
-    execute: async (args: unknown, { session, log }): Promise<string> => {
+    execute: async (args: unknown, { session }): Promise<string> => {
       const { id } = args as { id: string };
       const res = await monitorRequest(
         session,
@@ -444,7 +444,7 @@ Update a monitor. Pass any subset of fields to patch: \`name\`, \`status\` ("act
       id: z.string(),
       body: z.record(z.string(), z.any()),
     }),
-    execute: async (args: unknown, { session, log }): Promise<string> => {
+    execute: async (args: unknown, { session }): Promise<string> => {
       const { id, body } = args as {
         id: string;
         body: Record<string, unknown>;
@@ -504,7 +504,7 @@ Trigger a monitor check immediately, outside its normal schedule. Returns the qu
 \`\`\`
 `,
     parameters: z.object({ id: z.string() }),
-    execute: async (args: unknown, { session, log }): Promise<string> => {
+    execute: async (args: unknown, { session }): Promise<string> => {
       const { id } = args as { id: string };
       const res = await monitorRequest(
         session,
@@ -537,7 +537,7 @@ List historical checks for a monitor.
       offset: z.number().int().nonnegative().optional(),
       status: checkStatusSchema.optional(),
     }),
-    execute: async (args: unknown, { session, log }): Promise<string> => {
+    execute: async (args: unknown, { session }): Promise<string> => {
       const { id, limit, offset, status } = args as {
         id: string;
         limit?: number;
@@ -624,7 +624,7 @@ The endpoint paginates via a top-level \`next\` URL; this tool returns one page 
       skip: z.number().int().nonnegative().optional(),
       pageStatus: pageStatusSchema.optional(),
     }),
-    execute: async (args: unknown, { session, log }): Promise<string> => {
+    execute: async (args: unknown, { session }): Promise<string> => {
       const { id, checkId, limit, skip, pageStatus } = args as {
         id: string;
         checkId: string;
