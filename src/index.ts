@@ -1,8 +1,7 @@
 #!/usr/bin/env node
-import './node18-polyfills';
-import type FirecrawlAppType from '@mendable/firecrawl-js';
+import FirecrawlApp from '@mendable/firecrawl-js';
 import dotenv from 'dotenv';
-import type { Logger } from 'fastmcp';
+import { FastMCP, type Logger } from 'fastmcp';
 import type { IncomingHttpHeaders } from 'http';
 import { readFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
@@ -10,11 +9,6 @@ import path from 'node:path';
 import { z } from 'zod';
 import { registerMonitorTools } from './monitor';
 import { registerResearchTools } from './research';
-
-const { default: FirecrawlApp } = (await import('@mendable/firecrawl-js')) as {
-  default: typeof FirecrawlAppType;
-};
-const { FastMCP } = await import('fastmcp');
 
 dotenv.config({ debug: false, quiet: true });
 
@@ -422,7 +416,7 @@ if (openAiAppsChallengeToken) {
     );
 }
 
-function createClient(apiKey?: string): FirecrawlAppType {
+function createClient(apiKey?: string): FirecrawlApp {
   const config: any = {
     ...(process.env.FIRECRAWL_API_URL && {
       apiUrl: process.env.FIRECRAWL_API_URL,
@@ -443,7 +437,7 @@ const ORIGIN_HEADERS = { 'X-Origin': ORIGIN };
 // Safe mode is enabled by default for cloud service to comply with ChatGPT safety requirements
 const SAFE_MODE = process.env.CLOUD_SERVICE === 'true';
 
-function getClient(session?: SessionData): FirecrawlAppType {
+function getClient(session?: SessionData): FirecrawlApp {
   // For cloud service, API key is required
   if (process.env.CLOUD_SERVICE === 'true') {
     if (!session || !session.firecrawlApiKey) {
@@ -1464,7 +1458,7 @@ async function keylessPost(
 }
 
 async function getCrawlStatusWithOrigin(
-  client: FirecrawlAppType,
+  client: FirecrawlApp,
   jobId: string
 ): Promise<Record<string, unknown>> {
   const res = await (client as any).http.get(
@@ -1517,7 +1511,7 @@ async function getCrawlStatusWithOrigin(
 }
 
 async function waitForCrawlCompletionWithOrigin(
-  client: FirecrawlAppType,
+  client: FirecrawlApp,
   jobId: string,
   pollInterval = 2,
   timeout?: number
